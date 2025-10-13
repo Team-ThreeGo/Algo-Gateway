@@ -1,5 +1,6 @@
 package com.threego.algogateway.filter;
 
+import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import lombok.extern.slf4j.Slf4j;
 
@@ -23,8 +24,7 @@ import java.util.Set;
 public class AuthorizationHeaderFilter
         extends AbstractGatewayFilterFactory<AuthorizationHeaderFilter.Config> {
 
-    /* 설명. Application.yml에서부터 토큰관련 설정값을 불러오기 위해서 */
-    Environment env;
+    private final Environment env;
 
     @Autowired
     public AuthorizationHeaderFilter(Environment env) {
@@ -41,61 +41,59 @@ public class AuthorizationHeaderFilter
         return (exchange, chain) -> {
             ServerHttpRequest request = exchange.getRequest();
 
+            // Authorization 헤더 없으면 에러 반환
             if(!request.getHeaders().containsKey(HttpHeaders.AUTHORIZATION)) {
                 return onError(exchange, "No authorization header", HttpStatus.UNAUTHORIZED);
             }
 
-            /* 설명. 토큰을 들고 왔다면 추가 검증 */
-            HttpHeaders headers = request.getHeaders();  // springframework 패키지로 import할 것!
-
-            /* 설명. request header에 담긴 값들을 로그로 확인 */
-            Set<String> keys = headers.keySet();
-            log.info(">>>");
-            keys.stream().forEach(v -> {
-                log.info(v + "=" + request.getHeaders().get(v));
-            });
-            log.info("<<<");
-
-            /* 설명. "Authorization"이라는 키 값으로 넘어온 request header에 담긴 토큰 추출(JWT Token) */
+            // JWT Token 추출
             String bearerToken = request.getHeaders().get(HttpHeaders.AUTHORIZATION).get(0);
             String jwt = bearerToken.substring(7);
 
-            if(!isJwtValid(jwt)) {
+            // 유효성 검사
+            String subject = getSubject(jwt);
+            if (subject == null) {
                 return onError(exchange, "JWT token is not valid", HttpStatus.UNAUTHORIZED);
             }
+
+            Claims claims = Jwts.parser()
+                    .setSigningKey(env.getProperty("token.secret"))
+                    .parseClaimsJws(jwt)
+                    .getBody();
+
+            String memberId = claims.get("memberId", String.class);
+            String role = claims.get("role", String.class);
+            String email = claims.getSubject();
+            String nickname = claims.get("nickname", String.class);
+
+            // 요청 헤더에 사용자 정보 추가
+            ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+                    .header("X-Member-Id", memberId)
+                    .header("X-Role", role)
+                    .header("X-Email", email)
+                    .header("X-Nickname", nickname)
+                    .build();
+
+            ServerWebExchange modifiedExchange = exchange.mutate()
+                    .request(modifiedRequest)
+                    .build();
 
             return chain.filter(exchange);
         };
     }
 
-    /* 설명. 토큰 유효성 검사용 메소드 */
-    private boolean isJwtValid(String jwt) {
-        boolean returnValue = true;
-
-        String subject = null;
-
-        /* 설명. 기본적으로 우리 서버에서 만들었고, 만료기간이 지나지 않았으며, 토큰 안에 'sub'라는 등록된
-         *      클레임이 있는지 확인
-         * */
+    private String getSubject(String jwt) {
         try {
-            subject = Jwts.parser()
+            return Jwts.parser()
                     .setSigningKey(env.getProperty("token.secret"))
                     .parseClaimsJws(jwt)
                     .getBody()
                     .getSubject();
         } catch (Exception e) {
-            returnValue = false;
+            return null;
         }
-
-        /* 설명. 토큰의 payload에 subject 클레임 자체가 없거나 내용물이 없거나 */
-        if(subject == null || subject.isEmpty()) {
-            returnValue = false;
-        }
-
-        return returnValue;
     }
 
-    /* 설명. Mono는 아무 데이터도 반환하지 않고, 비동기적으로 완료됨을 나타내는 반환타입 */
     private Mono<Void> onError(ServerWebExchange exchange, String errorMessage, HttpStatus httpStatus) {
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(httpStatus);
