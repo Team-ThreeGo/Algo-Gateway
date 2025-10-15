@@ -16,9 +16,6 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.util.Set;
-
-/* 설명. 게이트웨이에서 토큰 유효성 검사를 위한 필터 */
 @Component
 @Slf4j
 public class AuthorizationHeaderFilter
@@ -40,34 +37,51 @@ public class AuthorizationHeaderFilter
     public GatewayFilter apply(Config config) {
         return (exchange, chain) -> {
             ServerHttpRequest request = exchange.getRequest();
+            String path = request.getURI().getPath();
 
             // Authorization 헤더 없으면 에러 반환
             if(!request.getHeaders().containsKey(HttpHeaders.AUTHORIZATION)) {
                 return onError(exchange, "No authorization header", HttpStatus.UNAUTHORIZED);
             }
 
-            // JWT Token 추출
-            String bearerToken = request.getHeaders().get(HttpHeaders.AUTHORIZATION).get(0);
+            // JWT 추출
+            String bearerToken = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            if (bearerToken == null || !bearerToken.startsWith("Bearer ")) {
+                return onError(exchange, "Invalid Authorization header format", HttpStatus.UNAUTHORIZED);
+            }
             String jwt = bearerToken.substring(7);
 
             // 유효성 검사
-            String subject = getSubject(jwt);
-            if (subject == null) {
+            // JWT 유효성 검증
+            Claims claims;
+            try {
+                claims = Jwts.parser()
+                        .setSigningKey(env.getProperty("token.secret"))
+                        .parseClaimsJws(jwt)
+                        .getBody();
+            } catch (Exception e) {
+                log.error("JWT 검증 실패: {}", e.getMessage());
                 return onError(exchange, "JWT token is not valid", HttpStatus.UNAUTHORIZED);
             }
 
-            Claims claims = Jwts.parser()
-                    .setSigningKey(env.getProperty("token.secret"))
-                    .parseClaimsJws(jwt)
-                    .getBody();
-
-            String memberId = claims.get("memberId", String.class);
-            String role = claims.get("role", String.class);
+            // Claim 추출 (타입 안정적으로 변환)
+            String memberId = String.valueOf(claims.get("memberId"));
+            String role = String.valueOf(claims.get("role"));
             String email = claims.getSubject();
-            String nickname = claims.get("nickname", String.class);
+            String nickname = String.valueOf(claims.get("nickname"));
 
-            // 요청 헤더에 사용자 정보 추가
-            ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+            log.info(">>> 인증된 사용자: memberId={}, role={}, email={}", memberId, role, email);
+
+            // 관리자 경로 접근 제한 (/admin/**)
+            if (path.startsWith("/admin")) {
+                boolean isAdmin = "ROLE_ADMIN".equals(role) || "ADMIN".equals(role);
+                if (!isAdmin) {
+                    return onError(exchange, "Access denied: ADMIN role required", HttpStatus.FORBIDDEN);
+                }
+            }
+
+            // 사용자 정보를 헤더에 추가하여 다음 서비스로 전달
+            ServerHttpRequest modifiedRequest = request.mutate()
                     .header("X-Member-Id", memberId)
                     .header("X-Role", role)
                     .header("X-Email", email)
@@ -78,7 +92,7 @@ public class AuthorizationHeaderFilter
                     .request(modifiedRequest)
                     .build();
 
-            return chain.filter(exchange);
+            return chain.filter(modifiedExchange);
         };
     }
 
@@ -97,8 +111,7 @@ public class AuthorizationHeaderFilter
     private Mono<Void> onError(ServerWebExchange exchange, String errorMessage, HttpStatus httpStatus) {
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(httpStatus);
-        log.info("에러 메시지: {}", errorMessage);
-
+        log.warn("요청 차단됨: {} (httpStatus={})", errorMessage, httpStatus);
         return response.setComplete();
     }
 }
