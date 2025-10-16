@@ -1,5 +1,6 @@
 package com.threego.algogateway.filter;
 
+import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import lombok.extern.slf4j.Slf4j;
 
@@ -15,16 +16,12 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.util.Set;
-
-/* 설명. 게이트웨이에서 토큰 유효성 검사를 위한 필터 */
 @Component
 @Slf4j
 public class AuthorizationHeaderFilter
         extends AbstractGatewayFilterFactory<AuthorizationHeaderFilter.Config> {
 
-    /* 설명. Application.yml에서부터 토큰관련 설정값을 불러오기 위해서 */
-    Environment env;
+    private final Environment env;
 
     @Autowired
     public AuthorizationHeaderFilter(Environment env) {
@@ -40,67 +37,81 @@ public class AuthorizationHeaderFilter
     public GatewayFilter apply(Config config) {
         return (exchange, chain) -> {
             ServerHttpRequest request = exchange.getRequest();
+            String path = request.getURI().getPath();
 
+            // Authorization 헤더 없으면 에러 반환
             if(!request.getHeaders().containsKey(HttpHeaders.AUTHORIZATION)) {
                 return onError(exchange, "No authorization header", HttpStatus.UNAUTHORIZED);
             }
 
-            /* 설명. 토큰을 들고 왔다면 추가 검증 */
-            HttpHeaders headers = request.getHeaders();  // springframework 패키지로 import할 것!
-
-            /* 설명. request header에 담긴 값들을 로그로 확인 */
-            Set<String> keys = headers.keySet();
-            log.info(">>>");
-            keys.stream().forEach(v -> {
-                log.info(v + "=" + request.getHeaders().get(v));
-            });
-            log.info("<<<");
-
-            /* 설명. "Authorization"이라는 키 값으로 넘어온 request header에 담긴 토큰 추출(JWT Token) */
-            String bearerToken = request.getHeaders().get(HttpHeaders.AUTHORIZATION).get(0);
+            // JWT 추출
+            String bearerToken = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            if (bearerToken == null || !bearerToken.startsWith("Bearer ")) {
+                return onError(exchange, "Invalid Authorization header format", HttpStatus.UNAUTHORIZED);
+            }
             String jwt = bearerToken.substring(7);
 
-            if(!isJwtValid(jwt)) {
+            // 유효성 검사
+            // JWT 유효성 검증
+            Claims claims;
+            try {
+                claims = Jwts.parser()
+                        .setSigningKey(env.getProperty("token.secret"))
+                        .parseClaimsJws(jwt)
+                        .getBody();
+            } catch (Exception e) {
+                log.error("JWT 검증 실패: {}", e.getMessage());
                 return onError(exchange, "JWT token is not valid", HttpStatus.UNAUTHORIZED);
             }
 
-            return chain.filter(exchange);
+            // Claim 추출 (타입 안정적으로 변환)
+            String memberId = String.valueOf(claims.get("memberId"));
+            String role = String.valueOf(claims.get("role"));
+            String email = claims.getSubject();
+            String nickname = String.valueOf(claims.get("nickname"));
+
+            log.info(">>> 인증된 사용자: memberId={}, role={}, email={}", memberId, role, email);
+
+            // 관리자 경로 접근 제한 (/admin/**)
+            if (path.startsWith("/admin")) {
+                boolean isAdmin = "ROLE_ADMIN".equals(role) || "ADMIN".equals(role);
+                if (!isAdmin) {
+                    return onError(exchange, "Access denied: ADMIN role required", HttpStatus.FORBIDDEN);
+                }
+            }
+
+            // 사용자 정보를 헤더에 추가하여 다음 서비스로 전달
+            ServerHttpRequest modifiedRequest = request.mutate()
+                    .header("X-Member-Id", memberId)
+                    .header("X-Role", role)
+                    .header("X-Email", email)
+                    .header("X-Nickname", nickname)
+                    .build();
+
+            ServerWebExchange modifiedExchange = exchange.mutate()
+                    .request(modifiedRequest)
+                    .build();
+
+            return chain.filter(modifiedExchange);
         };
     }
 
-    /* 설명. 토큰 유효성 검사용 메소드 */
-    private boolean isJwtValid(String jwt) {
-        boolean returnValue = true;
-
-        String subject = null;
-
-        /* 설명. 기본적으로 우리 서버에서 만들었고, 만료기간이 지나지 않았으며, 토큰 안에 'sub'라는 등록된
-         *      클레임이 있는지 확인
-         * */
+    private String getSubject(String jwt) {
         try {
-            subject = Jwts.parser()
+            return Jwts.parser()
                     .setSigningKey(env.getProperty("token.secret"))
                     .parseClaimsJws(jwt)
                     .getBody()
                     .getSubject();
         } catch (Exception e) {
-            returnValue = false;
+            return null;
         }
-
-        /* 설명. 토큰의 payload에 subject 클레임 자체가 없거나 내용물이 없거나 */
-        if(subject == null || subject.isEmpty()) {
-            returnValue = false;
-        }
-
-        return returnValue;
     }
 
-    /* 설명. Mono는 아무 데이터도 반환하지 않고, 비동기적으로 완료됨을 나타내는 반환타입 */
     private Mono<Void> onError(ServerWebExchange exchange, String errorMessage, HttpStatus httpStatus) {
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(httpStatus);
-        log.info("에러 메시지: {}", errorMessage);
-
+        log.warn("요청 차단됨: {} (httpStatus={})", errorMessage, httpStatus);
         return response.setComplete();
     }
 }
